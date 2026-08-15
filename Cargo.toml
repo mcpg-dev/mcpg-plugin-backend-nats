@@ -1,0 +1,58 @@
+[package]
+name = "mcpg-plugin-backend-nats"
+version = "0.1.0-alpha.16"
+license = "Apache-2.0"
+edition = "2024"
+description = """
+NATS backend plugin for mcpg. Provides tool dispatch over NATS
+request/reply (BackendPlugin for `kind: "nats"`) and resource-change
+subscription over NATS Core subjects (WatchStrategyPlugin for
+`kind: "nats_topic"`). The main mcpg binary depends on this crate at
+runtime via the plugin registry and carries no direct async-nats
+dependency.
+"""
+
+[lib]
+# cdylib: the .so the gateway's native_loader dlopens. rlib: in-tree
+# unit tests + the eager `new(client)` constructor (used by tests).
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Default OFF so the workspace build does not emit `mcpg_plugin_register`
+# from the rlib and collide with the other plugin rlibs. Standalone
+# cdylib builds (nx docker:build / OCI publish) opt in.
+default = []
+cdylib-export = []
+# Declared empty so the SDK macro's `register_static` accessor
+# (`#[cfg(feature = "static-firstparty")]`) does not trip
+# `unexpected_cfgs`. nats is consumed as a cdylib.
+static-firstparty = []
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# cdylib sync bridge: declare_plugin!, SyncBackendPlugin /
+# SyncWatchStrategyPlugin, HostHandle + HostHandleBackendHost.
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+anyhow = "1"
+async-nats = "0.47"
+async-trait = "0.1"
+blake3 = "1"
+bytes = "1"
+futures = "0.3"
+metrics = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `rt-multi-thread` powers the cdylib sync bridge's private runtime
+# (`Builder::new_multi_thread`).
+tokio = { version = "1", features = [
+  "sync",
+  "rt",
+  "rt-multi-thread",
+  "time",
+  "macros",
+] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
