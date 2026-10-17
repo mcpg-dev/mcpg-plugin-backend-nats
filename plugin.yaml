@@ -10,3 +10,27 @@ class: backend
 runtime: native-cdylib-v1
 protocol_version: "1.0"
 required_capabilities: [network_outbound]
+# MCP Events: how the nats_topic watch runs as a source, and what it emits.
+watch_strategies:
+  - kind: nats_topic
+    placement: single_owner
+    resume: false
+    event_types:
+      - name: nats.message
+        description: One message on the watched subject. Core NATS keeps no history, so nothing resumes.
+        payload_schema:
+          type: object
+          required: [subject, payloadEncoding]
+          properties:
+            subject: { type: string }
+            payload:
+              description: The message body, read as payloadEncoding says.
+            payloadEncoding:
+              description: How payload holds the body - its JSON, its UTF-8 text, or standard base64 of its bytes.
+              enum: [json, text, base64]
+            headers:
+              type: object
+              additionalProperties:
+                oneOf:
+                  - { type: string }
+                  - { type: array, items: { type: string } }

@@ -865,6 +865,45 @@ struct NatsWatchSpec {
     subject: String,
 }
 
+/// The event type of one message on the watched subject.
+pub const NATS_MESSAGE_EVENT_TYPE: &str = "nats.message";
+
+/// The `nats.message` event of one message. Core NATS has no message id;
+/// a `Nats-Msg-Id` header supplies one.
+fn message_event(message: &async_nats::Message) -> WatchEvent {
+    let mut headers = serde_json::Map::new();
+    let mut message_id = None;
+    if let Some(map) = &message.headers {
+        message_id = map
+            .get(async_nats::header::NATS_MESSAGE_ID)
+            .map(|v| v.to_string());
+        for (name, values) in map.iter() {
+            let mut values: Vec<serde_json::Value> = values
+                .iter()
+                .map(|v| serde_json::Value::String(v.to_string()))
+                .collect();
+            let value = if values.len() == 1 {
+                values.remove(0)
+            } else {
+                serde_json::Value::Array(values)
+            };
+            headers.insert(name.to_string(), value);
+        }
+    }
+    let (payload, payload_encoding) = mcpg_plugin_protocol::event_body(&message.payload);
+    WatchEvent {
+        event_id: message_id,
+        event_type: Some(NATS_MESSAGE_EVENT_TYPE.to_owned()),
+        data: Some(serde_json::json!({
+            "subject": message.subject.to_string(),
+            "payload": payload,
+            "payloadEncoding": payload_encoding,
+            "headers": headers,
+        })),
+        ..WatchEvent::default()
+    }
+}
+
 /// `WatchStrategyPlugin` implementation for `kind: "nats_topic"`.
 pub struct NatsWatchPlugin {
     manifest: PluginManifest,
@@ -1033,6 +1072,7 @@ impl WatchStrategyPlugin for NatsWatchPlugin {
             let cancel_child = cancel.clone();
             let uri_owned = resource_uri.to_owned();
             let subject_owned = parsed.subject;
+            let event_source = mcpg_plugin_protocol::is_event_source(resource_uri);
 
             // Long-lived watch loop — own its own span so events
             // emitted from the loop attribute back to the watch
@@ -1055,12 +1095,17 @@ impl WatchStrategyPlugin for NatsWatchPlugin {
                             }
                             msg = subscription.next() => {
                                 match msg {
-                                    Some(_nats_msg) => {
+                                    Some(nats_msg) => {
                                         metrics::counter!(
                                             "mcpg_nats_watch_events_total",
                                         )
                                         .increment(1);
-                                        sink.emit(WatchEvent::default()).await;
+                                        let event = if event_source {
+                                            message_event(&nats_msg)
+                                        } else {
+                                            WatchEvent::default()
+                                        };
+                                        sink.emit(event).await;
                                     }
                                     None => {
                                         // async-nats auto-reconnects the
@@ -1120,8 +1165,20 @@ pub struct NatsBackendCdylib {
     rt: tokio::runtime::Runtime,
 }
 
+/// Install the crypto provider rustls builds TLS configurations from: a
+/// build that links both rustls providers has no default, async-nats builds
+/// the configuration of a TLS connection from it, and this cdylib's copy of
+/// rustls does not see the host's.
+fn install_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = async_nats::rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl NatsBackendCdylib {
     pub fn from_host_config(config_json: &str, host: HostHandle) -> Self {
+        install_crypto_provider();
         Self {
             inner: NatsBackendPlugin::from_config_json(config_json),
             host: Arc::new(HostHandleBackendHost::new(host)),
@@ -1189,6 +1246,7 @@ pub struct NatsWatchCdylib {
 
 impl NatsWatchCdylib {
     pub fn from_host_config(config_json: &str, _host: HostHandle) -> Self {
+        install_crypto_provider();
         Self {
             inner: NatsWatchPlugin::from_config_json(config_json),
             rt: build_bridge_runtime("mcpg-watch-nats"),
@@ -1291,6 +1349,54 @@ mcpg_plugin_sdk::declare_plugin! {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_tls_configuration_can_be_built_once_the_plugin_is_made() {
+        // SAFETY: `stub_host_ref` returns a process-static no-op host ref.
+        #[allow(unsafe_code)]
+        let host = unsafe { HostHandle::from_ffi(mcpg_plugin_sdk::testing::stub_host_ref()) };
+        let _plugin = NatsWatchCdylib::from_host_config("{}", host);
+        let _ = async_nats::rustls::ClientConfig::builder();
+    }
+
+    #[test]
+    fn a_message_becomes_a_nats_message_event() {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("Nats-Msg-Id", "m-1");
+        headers.insert("trace", "abc");
+        let message = async_nats::Message {
+            subject: "orders.created".into(),
+            reply: None,
+            payload: bytes::Bytes::from_static(br#"{"id":"o-1"}"#),
+            headers: Some(headers),
+            status: None,
+            description: None,
+            length: 0,
+        };
+        let event = message_event(&message);
+        assert_eq!(event.event_id.as_deref(), Some("m-1"));
+        assert_eq!(event.event_type.as_deref(), Some(NATS_MESSAGE_EVENT_TYPE));
+        assert_eq!(
+            event.data,
+            Some(serde_json::json!({
+                "subject": "orders.created",
+                "payload": { "id": "o-1" },
+                "payloadEncoding": "json",
+                "headers": { "Nats-Msg-Id": "m-1", "trace": "abc" },
+            }))
+        );
+
+        let bare = async_nats::Message {
+            headers: None,
+            payload: bytes::Bytes::from_static(&[0xff, 0x00]),
+            ..message
+        };
+        let event = message_event(&bare);
+        assert_eq!(event.event_id, None, "the host assigns an id");
+        let data = event.data.unwrap();
+        assert_eq!(data["payload"], "/wA=");
+        assert_eq!(data["payloadEncoding"], "base64");
+    }
+
     /// Serialises port allocation and server bind across the tests in this
     /// binary.
     ///
@@ -1311,6 +1417,29 @@ mod tests {
             .local_addr()
             .expect("local addr")
             .port()
+    }
+
+    /// Subscribe `worker` to `subject`, returning once the server routes the
+    /// subject to it. The server handles one connection's operations in
+    /// order, so a probe published after the SUB that comes back proves the
+    /// SUB is in force for every connection. A flush proves less: it only
+    /// empties the client's socket buffer.
+    async fn subscribe_routed(
+        worker: &async_nats::Client,
+        subject: &str,
+    ) -> async_nats::Subscriber {
+        let sub = worker.subscribe(subject.to_owned()).await.unwrap();
+        let probe_subject = worker.new_inbox();
+        let mut probe = worker.subscribe(probe_subject.clone()).await.unwrap();
+        worker
+            .publish(probe_subject, Default::default())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), probe.next())
+            .await
+            .expect("the probe comes back")
+            .expect("the probe subscription stays open");
+        sub
     }
 
     /// Start a NATS server on its own port, returning the child and the port.
@@ -1537,10 +1666,7 @@ mod tests {
 
         // Worker subscribes and echoes back
         let worker = async_nats::connect(&url).await.unwrap();
-        let mut sub = worker
-            .subscribe("mcpg.exec.request.tools.echo")
-            .await
-            .unwrap();
+        let mut sub = subscribe_routed(&worker, "mcpg.exec.request.tools.echo").await;
         tokio::spawn(async move {
             if let Some(msg) = sub.next().await
                 && let Some(reply) = msg.reply
@@ -1548,7 +1674,6 @@ mod tests {
                 worker.publish(reply, msg.payload).await.ok();
             }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let resp = plugin
             .execute(
@@ -1678,17 +1803,7 @@ mod tests {
         // headers into the response payload (JSON-encoded) so the
         // assertion can inspect what landed on the broker.
         let worker = async_nats::connect(&url).await.unwrap();
-        let mut sub = worker
-            .subscribe("mcpg.exec.request.tools.echo_idem")
-            .await
-            .unwrap();
-        // Flush on the SAME handle that issued the SUB, and before it is moved
-        // into the task. Ordering holds within one client handle; a clone is a
-        // separate sender, so a PING sent through it can reach the server
-        // ahead of the SUB and the PONG then proves nothing. That is what made
-        // this test fail with `no responders` while its sleeping sibling
-        // passed.
-        worker.flush().await.unwrap();
+        let mut sub = subscribe_routed(&worker, "mcpg.exec.request.tools.echo_idem").await;
         tokio::spawn(async move {
             if let Some(msg) = sub.next().await
                 && let Some(reply) = msg.reply
