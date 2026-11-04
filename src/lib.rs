@@ -1685,6 +1685,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -1715,6 +1716,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -1756,6 +1758,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -1852,6 +1855,7 @@ mod tests {
                         key: "idem-test-key".to_owned(),
                         scope_hash: "deadbeefdeadbeefdeadbeefdeadbeef".to_owned(),
                     }),
+                    client: None,
                 },
             )
             .await
