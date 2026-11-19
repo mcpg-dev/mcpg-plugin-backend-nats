@@ -6,7 +6,8 @@ Dispatches MCP tool calls as NATS request/reply: the call arguments are
 published to an operator-fixed subject, and the reply that arrives on the
 auto-generated inbox becomes the tool result. The same artifact also ships a
 watch strategy that subscribes to a subject and turns every message on it into a
-`notifications/resources/updated` for subscribed sessions. Reach for it when the
+`notifications/resources/updated` on the `subscriptions/listen` streams that
+name the resource. Reach for it when the
 system behind a tool is already a NATS responder, or when you want subject-based
 routing instead of a point-to-point HTTP call — and so the gateway binary itself
 carries no NATS client.
